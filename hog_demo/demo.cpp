@@ -14,11 +14,11 @@
 #include "opencv2/objdetect.hpp"
 #include "opencv2/imgproc.hpp"
 
-//using namespace std;
-//using namespace cv;
-//
-//bool help_showed = false;
-//
+using namespace std;
+using namespace cv;
+
+bool help_showed = false;
+
 //class Args
 //{
 //public:
@@ -560,7 +560,7 @@
 
 int main()
 {
-	test_main();
+	test::test_main();
 	//cv::cuda::printShortCudaDeviceInfo(cv::cuda::getDevice());
 	system("pause");
 

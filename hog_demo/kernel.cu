@@ -1,6 +1,5 @@
 
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
+#include "kernel.h"
 
 #include "opencv2/core/cuda/common.hpp"
 #include "opencv2/core/cuda/reduce.hpp"
@@ -9,137 +8,153 @@
 
 #include <stdio.h>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
-
-__global__ void addKernel(int *c, const int *a, const int *b)
+namespace test
 {
-	int i = threadIdx.x;
-	c[i] = a[i] + b[i];
+	cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+
+	__global__ void addKernel(int *c, const int *a, const int *b)
+	{
+		int i = threadIdx.x;
+		c[i] = a[i] + b[i];
+	}
+
+	int test_main()
+	{
+		const int arraySize = 5;
+		const int a[arraySize] = { 1, 2, 3, 4, 5 };
+		const int b[arraySize] = { 10, 20, 30, 40, 50 };
+		int c[arraySize] = { 0 };
+
+		// Add vectors in parallel.
+		cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "addWithCuda failed!");
+			return 1;
+		}
+
+		printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
+			c[0], c[1], c[2], c[3], c[4]);
+
+		// cudaDeviceReset must be called before exiting in order for profiling and
+		// tracing tools such as Nsight and Visual Profiler to show complete traces.
+		cudaStatus = cudaDeviceReset();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceReset failed!");
+			return 1;
+		}
+
+		return 0;
+	}
+
+	// Helper function for using CUDA to add vectors in parallel.
+	cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+	{
+		int *dev_a = 0;
+		int *dev_b = 0;
+		int *dev_c = 0;
+		cudaError_t cudaStatus;
+
+		// Choose which GPU to run on, change this on a multi-GPU system.
+		cudaStatus = cudaSetDevice(0);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+			goto Error;
+		}
+
+		// Allocate GPU buffers for three vectors (two input, one output)    .
+		cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed!");
+			goto Error;
+		}
+
+		cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed!");
+			goto Error;
+		}
+
+		cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMalloc failed!");
+			goto Error;
+		}
+
+		// Copy input vectors from host memory to GPU buffers.
+		cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMemcpy failed!");
+			goto Error;
+		}
+
+		cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMemcpy failed!");
+			goto Error;
+		}
+
+		// Launch a kernel on the GPU with one thread for each element.
+		addKernel << <1, size >> >(dev_c, dev_a, dev_b);
+
+		// Check for any errors launching the kernel
+		cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
+		}
+
+		// cudaDeviceSynchronize waits for the kernel to finish, and returns
+		// any errors encountered during the launch.
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+			goto Error;
+		}
+
+		// Copy output vector from GPU buffer to host memory.
+		cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMemcpy failed!");
+			goto Error;
+		}
+
+	Error:
+		cudaFree(dev_c);
+		cudaFree(dev_a);
+		cudaFree(dev_b);
+
+		return cudaStatus;
+	}
 }
 
-int test_main()
-{
-	const int arraySize = 5;
-	const int a[arraySize] = { 1, 2, 3, 4, 5 };
-	const int b[arraySize] = { 10, 20, 30, 40, 50 };
-	int c[arraySize] = { 0 };
 
-	// Add vectors in parallel.
-	cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "addWithCuda failed!");
-		return 1;
-	}
+/*常量内存
+// 位置：设备内存
+// 形式：关键字__constant__添加到变量声明中。如__constant__ float s[10]; 。
+// 目的：为了提升性能。常量内存采取了不同于标准全局内存的处理方式。在某些情况下，用常量内存替换全局内存能有效地减少内存带宽。
+// 特点：常量内存用于保存在核函数执行期间不会发生变化的数据。变量的访问限制为只读。NVIDIA硬件提供了64KB的常量内存。不再需要cudaMalloc()或者cudaFree(), 而是在编译时，静态地分配空间。
+// 要求：当我们需要拷贝数据到常量内存中应该使用cudaMemcpyToSymbol()，而cudaMemcpy()会复制到全局内存。
+// 性能提升的原因：
+    对常量内存的单次读操作可以广播到其他的“邻近”线程。这将节约15次读取操作。（为什么是15，因为“邻近”指半个线程束，一个线程束包含32个线程的集合。）
+    常量内存的数据将缓存起来，因此对相同地址的连续读操作将不会产生额外的内存通信量。
+*/
 
-	printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-		c[0], c[1], c[2], c[3], c[4]);
+// using CUDA to hog
+__constant__ int cnbins;				// 直方图bin的数量(投票箱的个数)
+__constant__ int cblock_stride_x;		// x方向块的滑动步长，大小只支持是单元格cell_size大小的倍数
+__constant__ int cblock_stride_y;		//
+__constant__ int cnblocks_win_x;		// x方向 每个window中的block数
+__constant__ int cnblocks_win_y;		// 
+__constant__ int cncells_block_x;		// x方向 每个block中的cell数
+__constant__ int cncells_block_y;		//
+__constant__ int cblock_hist_size;		// 每个block的直方图大小
+__constant__ int cblock_hist_size_2up;	// 
+__constant__ int cdescr_size;			//HOG特征向量的维数
+__constant__ int cdescr_width;			//
 
-	// cudaDeviceReset must be called before exiting in order for profiling and
-	// tracing tools such as Nsight and Visual Profiler to show complete traces.
-	cudaStatus = cudaDeviceReset();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceReset failed!");
-		return 1;
-	}
 
-	return 0;
-}
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-	int *dev_a = 0;
-	int *dev_b = 0;
-	int *dev_c = 0;
-	cudaError_t cudaStatus;
-
-	// Choose which GPU to run on, change this on a multi-GPU system.
-	cudaStatus = cudaSetDevice(0);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-		goto Error;
-	}
-
-	// Allocate GPU buffers for three vectors (two input, one output)    .
-	cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	// Copy input vectors from host memory to GPU buffers.
-	cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
-	}
-
-	// Launch a kernel on the GPU with one thread for each element.
-	addKernel << <1, size >> >(dev_c, dev_a, dev_b);
-
-	// Check for any errors launching the kernel
-	cudaStatus = cudaGetLastError();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-		goto Error;
-	}
-
-	// cudaDeviceSynchronize waits for the kernel to finish, and returns
-	// any errors encountered during the launch.
-	cudaStatus = cudaDeviceSynchronize();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-		goto Error;
-	}
-
-	// Copy output vector from GPU buffer to host memory.
-	cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMemcpy failed!");
-		goto Error;
-	}
-
-Error:
-	cudaFree(dev_c);
-	cudaFree(dev_a);
-	cudaFree(dev_b);
-
-	return cudaStatus;
-}
-
-// Helper function for using CUDA to hog
-__constant__ int cnbins;
-__constant__ int cblock_stride_x;
-__constant__ int cblock_stride_y;
-__constant__ int cnblocks_win_x;
-__constant__ int cnblocks_win_y;
-__constant__ int cncells_block_x;
-__constant__ int cncells_block_y;
-__constant__ int cblock_hist_size;
-__constant__ int cblock_hist_size_2up;
-__constant__ int cdescr_size;
-__constant__ int cdescr_width;
-
-/* Returns the nearest upper power of two, works only for
-the typical GPU thread count (pert block) values */
+/* 返回最接近的两个上限，仅适用于
+典型的GPU线程数（pert block）值 */
 int power_2up(unsigned int n)
 {
 	if (n <= 1) return 1;
@@ -156,7 +171,7 @@ int power_2up(unsigned int n)
 	return -1; // Input is too big
 }
 
-/* Returns the max size for nblocks */
+/* 返回nblocks的最大值 */
 int max_nblocks(int nthreads, int ncells_block = 1)
 {
 	int threads = nthreads * ncells_block;
@@ -170,7 +185,15 @@ int max_nblocks(int nthreads, int ncells_block = 1)
 		return 1;
 }
 
-
+/*
+// nbins：直方图bin的数量，目前每个单元格Cell只支持9个
+// block_stride_x：width方向block的滑动步长，大小只支持单元格cell_size大小的倍数
+//
+// nblocks_win_x：blocks_per_win.width
+//
+// ncells_block_x：cells_per_block_.width
+//
+*/
 void set_up_constants(int nbins,
 	int block_stride_x, int block_stride_y,
 	int nblocks_win_x, int nblocks_win_y,
@@ -188,6 +211,7 @@ void set_up_constants(int nbins,
 	int block_hist_size = nbins * ncells_block_x * ncells_block_y;
 	cudaSafeCall(cudaMemcpyToSymbolAsync(cblock_hist_size, &block_hist_size, sizeof(block_hist_size), 0, cudaMemcpyHostToDevice, stream));
 
+	//最接近的上限，给gpu per block
 	int block_hist_size_2up = power_2up(block_hist_size);
 	cudaSafeCall(cudaMemcpyToSymbolAsync(cblock_hist_size_2up, &block_hist_size_2up, sizeof(block_hist_size_2up), 0, cudaMemcpyHostToDevice, stream));
 
@@ -200,10 +224,10 @@ void set_up_constants(int nbins,
 
 
 //----------------------------------------------------------------------------
-// Histogram computation
+// 直方图计算
 //
-// CUDA kernel to compute the histograms
-template <int nblocks> // Number of histogram blocks processed by single GPU thread block
+// CUDA内核来计算直方图
+template <int nblocks> // 单个GPU线程块处理的直方图块的数量
 __global__ void compute_hists_kernel_many_blocks(const int img_block_width, const cv::cuda::PtrStepf grad,
 	const cv::cuda::PtrStepb qangle, float scale, float* block_hists,
 	int cell_size, int patch_size, int block_patch_size,
@@ -221,7 +245,7 @@ __global__ void compute_hists_kernel_many_blocks(const int img_block_width, cons
 	float* hists = smem;
 	float* final_hist = smem + cnbins * block_patch_size * nblocks;
 
-	// patch_size means that patch_size pixels affect on block's cell
+	// patch_size means that patch_size pixels affect on block's cell 如何理解？
 	if (cell_thread_x < patch_size)
 	{
 		const int offset_x = (blockIdx.x * blockDim.z + block_x) * cblock_stride_x +
@@ -283,7 +307,7 @@ __global__ void compute_hists_kernel_many_blocks(const int img_block_width, cons
 		blockIdx.x * blockDim.z + block_x) *
 		cblock_hist_size;
 
-	//copying from final_hist to block_hist
+	//从final_hist复制到block_hist
 	int tid;
 	if (threads_cell < cnbins)
 	{
@@ -306,7 +330,22 @@ __global__ void compute_hists_kernel_many_blocks(const int img_block_width, cons
 	}
 }
 
-//declaration of variables and invoke the kernel with the calculated number of blocks
+
+/*
+// nbins：直方图bin的数量，目前每个单元格Cell只支持9个
+// block_stride_x：x方向块的滑动步长，大小只支持是单元格cell_size大小的倍数
+
+// 源图像只支持CV_8UC1和CV_8UC4数据类型
+// height：输入图像行数rows
+// width：输入图像列数cols
+
+// grad：输出梯度（两通道），记录每个像素所属bin对应的权重的矩阵，为幅值乘以权值。这个权值是关键，也很复杂：包括高斯权重，三次插值的权重，在本函数中先只考虑幅值和相邻bin间的插值权重
+// qangle：输入弧度（两通道），记录每个像素角度所属的bin序号的矩阵,均为2通道,为了线性插值
+// sigma：winSigma，高斯滤波窗口的参数
+// *block_hists：block_hists.ptr<float>？？
+*/
+
+// 声明变量，并用计算的blocks数调用kernel
 void compute_hists(int nbins,
 	int block_stride_x, int block_stride_y,
 	int height, int width,
@@ -320,27 +359,51 @@ void compute_hists(int nbins,
 	const int ncells_block = ncells_block_x * ncells_block_y;
 	const int patch_side = cell_size_x / 4;
 	const int patch_size = cell_size_x + (patch_side * 2);
+	// 不共享的block数，共享的反复计算，可以存到shared memory
 	const int block_patch_size = ncells_block * patch_size;
 	const int threads_cell = power_2up(patch_size);
 	const int threads_block = ncells_block * threads_cell;
 	const int half_cell_size = cell_size_x / 2;
 
+	// x方向block个数，相邻block之间会有重叠，y方向同理
 	int img_block_width = (width - ncells_block_x * cell_size_x + block_stride_x) /
 		block_stride_x;
 	int img_block_height = (height - ncells_block_y * cell_size_y + block_stride_y) /
 		block_stride_y;
 
+	/*
+	// fuction:divUp(int total, int grain)
+	// return:(total + grain - 1) / grain;
+	*/
 	const int nblocks = max_nblocks(threads_cell, ncells_block);
 	dim3 grid(cv::cuda::device::divUp(img_block_width, nblocks), img_block_height);
 	dim3 threads(threads_cell * ncells_block_x, ncells_block_y, nblocks);
 
-	// Precompute gaussian spatial window parameter
+	// 预计算高斯空间Window参数
 	float scale = 1.f / (2.f * sigma * sigma);
 
 	int hists_size = (nbins * ncells_block * patch_size * nblocks) * sizeof(float);
 	int final_hists_size = (nbins * ncells_block * nblocks) * sizeof(float);
 	int smem = hists_size + final_hists_size;
-	if (nblocks == 4)
+
+	/*
+	// 核函数只能在主机端调用，调用时必须申明执行参数
+	// <<<>>>运算符内是核函数的执行参数，告诉编译器运行时如何启动核函数，用于说明内核函数中的线程数量，以及线程是如何组织的
+
+	// 参数grid用于定义整个grid的维度和尺寸，即一个grid有多少个block，为dim3类型
+	// Dim3 grid(grid.x, grid.y, 1)表示grid中每行有grid.x个block，每列有grid.y个block，第三维恒为1(目前一个核函数只有一个grid)
+	// 整个grid中共有grid.x*grid.y个block，其中grid.x和grid.y最大值为65535
+
+	// 参数threads用于定义一个block的维度和尺寸，即一个block有多少个thread，为dim3类型
+	// Dim3 threads(threads.x, threads.y, threads.z)表示整个block中每行有threads.x个thread，每列有threads.y个thread，高度为threads.z。threads.x和threads.y最大值为1024，threads.z最大值为62
+	// 一个block中共有threads.x*threads.y*threads.z个thread
+
+	// 参数smem是一个可选参数，用于设置每个block除了静态分配的shared Memory以外，最多能动态分配的shared memory大小，单位为byte。不需要动态分配时该值为0或省略不写
+
+	// 参数stream是一个cudaStream_t类型的可选参数，初始值为零，表示该核函数处在哪个流之中。
+	*/
+
+	if (nblocks == 4) 
 		compute_hists_kernel_many_blocks<4> << <grid, threads, smem, stream >> >(img_block_width, grad, qangle, scale, block_hists, cell_size_x, patch_size, block_patch_size, threads_cell, threads_block, half_cell_size);
 	else if (nblocks == 3)
 		compute_hists_kernel_many_blocks<3> << <grid, threads, smem, stream >> >(img_block_width, grad, qangle, scale, block_hists, cell_size_x, patch_size, block_patch_size, threads_cell, threads_block, half_cell_size);
@@ -354,16 +417,22 @@ void compute_hists(int nbins,
 
 
 //-------------------------------------------------------------
-//  Normalization of histograms via L2Hys_norm
+//  通过L2Hys_norm(Lowe-style被截去的L2范数)对直方图进行归一化
 //
 
 
+// 减少共享内存
 template<int size>
 __device__ float reduce_smem(float* smem, float val)
 {
 	unsigned int tid = threadIdx.x;
 	float sum = val;
-
+	/*
+	// reduce函数作用：？
+	   第一个参数：源
+	   第二个参数：
+	   第三个参数：
+	*/
 	cv::cuda::device::reduce<size>(smem, sum, tid, cv::cuda::device::plus<float>());
 
 	if (size == 32)
@@ -388,8 +457,8 @@ __device__ float reduce_smem(float* smem, float val)
 }
 
 
-template <int nthreads, // Number of threads which process one block historgam
-	int nblocks> // Number of block hisograms processed by one GPU thread block
+template <int nthreads, // 处理一个块直方图的线程数
+	int nblocks> // 由一个GPU block处理的块直方图的数量
 	__global__ void normalize_hists_kernel_many_blocks(const int block_hist_size,
 	const int img_block_width,
 	float* block_hists, float threshold)
@@ -897,7 +966,7 @@ void compute_gradients_8UC1(int nbins,
 
 
 //-------------------------------------------------------------------
-// Resize
+// 归一化
 
 texture<uchar4, 2, cudaReadModeNormalizedFloat> resize8UC4_tex;
 texture<uchar, 2, cudaReadModeNormalizedFloat> resize8UC1_tex;
