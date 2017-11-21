@@ -159,6 +159,7 @@ copy "$(CudaToolkitBinDir)\cudart*.dll" "$(OutDir)"</Command>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="demo.cpp" />
+    <ClCompile Include="hog.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="kernel.h" />
