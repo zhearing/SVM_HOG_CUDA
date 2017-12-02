@@ -128,7 +128,7 @@ namespace test
 }
 
 
-namespace hog
+namespace HOG
 {
 	/*常量内存
 	// 位置：设备内存
@@ -225,6 +225,21 @@ namespace hog
 	}
 
 
+	/*
+	法1.accumulate using atomics
+		即，将最后一句变成
+		atomicAdd(&(d_bins[myBin]), 1);
+		但是对于atomics的方法而言，不管GPU多好，并行线程数都被限制到histogram个数N，也就是最多只有N个线程并行。 
+	法2. local memory + reduce 
+		设置n个并行线程，每个线程都有自己的local histogram（一个长为bin数的vector）
+		即每个local histogram都被一个thread顺序访问，所以这样没有shared memory，即便没有用atomics也不会出现read-modify-write问题。
+		然后，我们将这n个histogram进行合并（即加和），可以通过reduce实现。 
+	法3. sort then reduce by key 
+		将数据组织成key-value对，key为histogram bin，value为1，
+		将其按key排序，然后对相同key进行reduce求和，就可以得到histogram中的每个bin的总数。
+		ics的方法而言，不管GPU多好，并行线程数都被限制到histogram个数N，也就是最多只有N个线程并行。
+	*/
+
 	//----------------------------------------------------------------------------
 	// 直方图计算
 	//
@@ -253,6 +268,7 @@ namespace hog
 		// 一行有12个pixel影响cell
 		if (cell_thread_x < patch_size) //12
 		{
+			// 滑动窗口的坐标
 			const int offset_x = (blockIdx.x * blockDim.z + block_x) * cblock_stride_x +
 				half_cell_size * cell_x + cell_thread_x; // imageblock的x索引 * 8 + 4 * cell的x索引
 			const int offset_y = blockIdx.y * cblock_stride_y + half_cell_size * cell_y; // y索引 * 8 + 4 * cell的y索引
@@ -283,6 +299,7 @@ namespace hog
 				int dist_center_y = dist_y - half_cell_size * (1 - 2 * cell_y);
 				int dist_center_x = dist_x - half_cell_size * (1 - 2 * cell_x);
 
+				//二维高斯分布，好抽象啊，看不懂
 				float gaussian = ::expf(-(dist_center_y * dist_center_y +
 					dist_center_x * dist_center_x) * scale);
 
@@ -293,7 +310,7 @@ namespace hog
 				hist[bin.y * block_patch_size * nblocks] += gaussian * interp_weight * vote.y;
 			}
 
-			// 规约直方图
+			// 归约直方图？？？
 			volatile float* hist_ = hist;
 			for (int bin_id = 0; bin_id < cnbins; ++bin_id, hist_ += block_patch_size * nblocks)
 			{
@@ -347,7 +364,7 @@ namespace hog
 	// grad：输出梯度（两通道），记录每个像素所属bin对应的权重的矩阵，为幅值乘以权值。这个权值是关键，也很复杂：包括高斯权重，三次插值的权重，在本函数中先只考虑幅值和相邻bin间的插值权重
 	// qangle：输入弧度（两通道），记录每个像素角度所属的bin序号的矩阵,均为2通道,为了线性插值
 	// sigma：winSigma，高斯滤波窗口的参数
-	// *block_hists：block_hists.ptr<float>？？
+	// *block_hists：block_hists.ptr<float>
 	*/
 
 	// 声明变量，并用计算的blocks数调用kernel
